@@ -1,0 +1,148 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Fonctions utilitaires
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isInLobby(lobbyData) {
+      return isAuthenticated() && 
+        (lobbyData.playerIds.hasAny([request.auth.uid]));
+    }
+    
+    function isLobbyHost(lobbyData) {
+      return isAuthenticated() && 
+        lobbyData.hostId == request.auth.uid;
+    }
+
+    function isLobbyActive(lobbyData) {
+      return lobbyData.status == 'waiting';
+    }
+
+    // Règles pour la collection users
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated() && 
+        (isOwner(userId) || request.auth.token.firebase.sign_in_provider == 'anonymous');
+      allow delete: if false;
+    }
+    
+    // Règles pour la collection lobbies
+    match /lobbies/{lobbyId} {
+      // Lecture des lobbies
+      allow read: if isAuthenticated();
+      
+      // Création d'un nouveau lobby
+      allow create: if isAuthenticated() && 
+        request.resource.data.hostId == request.auth.uid &&
+        request.resource.data.playerIds.hasAll([request.auth.uid]) &&
+        request.resource.data.playerNames.size() == request.resource.data.playerIds.size() &&
+        request.resource.data.maxPlayers >= 2 &&
+        request.resource.data.maxPlayers <= 24 &&
+        request.resource.data.status == 'waiting' &&
+        (request.resource.data.roleDistribution == null || request.resource.data.roleDistribution is map);
+      
+      // Mise à jour du lobby
+      allow update: if isAuthenticated() && (
+        // L'hôte peut tout modifier
+        isLobbyHost(resource.data) ||
+        // Les joueurs peuvent rejoindre/quitter
+        (
+          isLobbyActive(resource.data) &&
+          // Préservation des champs non modifiables par les joueurs
+          request.resource.data.hostId == resource.data.hostId &&
+          request.resource.data.code == resource.data.code &&
+          request.resource.data.maxPlayers == resource.data.maxPlayers &&
+          request.resource.data.isPublic == resource.data.isPublic &&
+          request.resource.data.status == resource.data.status &&
+          request.resource.data.createdAt == resource.data.createdAt &&
+          request.resource.data.startedAt == resource.data.startedAt &&
+          // Les joueurs ne peuvent modifier que playerIds et playerNames
+          (
+            // Rejoindre
+            (
+              !resource.data.playerIds.hasAll([request.auth.uid]) &&
+              request.resource.data.playerIds.hasAll([request.auth.uid]) &&
+              resource.data.playerIds.size() < resource.data.maxPlayers
+            ) ||
+            // Quitter
+            (
+              resource.data.playerIds.hasAll([request.auth.uid]) &&
+              !request.resource.data.playerIds.hasAll([request.auth.uid])
+            )
+          )
+        )
+      );
+      
+      // Suppression d'un lobby
+      allow delete: if isAuthenticated() && (
+        isLobbyHost(resource.data) ||
+        resource.data.playerIds.size() == 0
+      );
+
+      // Règles pour les messages du lobby
+      match /messages/{messageId} {
+        allow read: if isAuthenticated();
+        allow create: if isAuthenticated() && 
+          (
+            // Message système
+            request.resource.data.senderId == 'system' ||
+            // Message d'un joueur
+            (
+              request.resource.data.senderId == request.auth.uid &&
+              (
+                // Le joueur est dans le lobby
+                get(/databases/$(database)/documents/lobbies/$(lobbyId)).data.playerIds.hasAny([request.auth.uid]) ||
+                // Ou c'est un message d'un joueur qui quitte/rejoint (traité par le service)
+                request.resource.data.type == 'system'
+              )
+            )
+          );
+        allow update, delete: if false;
+      }
+      
+      // Règles pour les actions de jeu
+      match /actions/{actionId} {
+        allow read: if isInLobby(get(/databases/$(database)/documents/lobbies/$(lobbyId)).data);
+        allow create: if isInLobby(get(/databases/$(database)/documents/lobbies/$(lobbyId)).data) &&
+          request.resource.data.playerId == request.auth.uid;
+      }
+      
+      // Règles pour les votes
+      match /votes/{voteId} {
+        allow read: if isInLobby(get(/databases/$(database)/documents/lobbies/$(lobbyId)).data);
+        allow create, update: if isInLobby(get(/databases/$(database)/documents/lobbies/$(lobbyId)).data) &&
+          request.resource.data.voterId == request.auth.uid;
+      }
+    }
+
+    // Fonction pour vérifier si l'utilisateur est membre du jeu
+    function isGameMember(gameId) {
+      let lobbyDoc = get(/databases/$(database)/documents/lobbies/$(gameId));
+      return lobbyDoc.data.playerIds.hasAny([request.auth.uid]);
+    }
+
+    // Règles pour la collection chat_messages - MODIFIÉES POUR LE DÉVELOPPEMENT
+    match /chat_messages/{messageId} {
+      // Permettre toutes les opérations pour le développement
+      allow read, write: if isAuthenticated();
+    }
+
+    // Règles pour la collection chat_permissions - MODIFIÉES POUR LE DÉVELOPPEMENT
+    match /chat_permissions/{permissionId} {
+      // Permettre toutes les opérations pour le développement
+      allow read, write: if isAuthenticated();
+    }
+
+    // Règle par défaut
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+} 
